@@ -1,0 +1,258 @@
+import time
+import uuid
+import json
+import requests
+from typing import Dict, Any, List
+from pydantic import BaseModel
+
+# =============================================================
+# CONFIG
+# =============================================================
+
+OLLAMA_URL = "http://localhost:11434/api/generate"
+PRIMARY_MODEL = "llama3.1"
+GUARD_MODEL = "llama3.1:instruct"
+VERIFIER_MODEL = "llama3.1:instruct"
+
+SELF_CONSISTENCY_RUNS = 5   # multi-pass accuracy boost
+
+
+# =============================================================
+# MODEL CALL HELPER
+# =============================================================
+
+def call_ollama(model: str, prompt: str) -> str:
+    """Simple wrapper for Ollama."""
+    body = {"model": model, "prompt": prompt}
+    r = requests.post(OLLAMA_URL, json=body)
+    data = r.json()
+    return data.get("response", "").strip()
+
+
+# =============================================================
+# LOGGING STRUCTURES
+# =============================================================
+
+class InfoFlowLog(BaseModel):
+    id: str
+    timestamp: float
+    sender: str
+    receiver: str
+    content: str
+    purpose: str
+
+
+class LogTracker:
+    def __init__(self):
+        self.logs: List[InfoFlowLog] = []
+
+    def add(self, sender, receiver, content, purpose):
+        entry = InfoFlowLog(
+            id=str(uuid.uuid4()),
+            timestamp=time.time(),
+            sender=sender,
+            receiver=receiver,
+            content=content,
+            purpose=purpose
+        )
+        self.logs.append(entry)
+
+    def dump(self):
+        return [log.dict() for log in self.logs]
+
+
+# =============================================================
+# ACCURACY VERIFIER
+# =============================================================
+
+def accuracy_review(query: str, answer: str) -> Dict:
+    """Checks correctness & hallucination risk."""
+    prompt = f"""
+You are an accuracy-verifier model.
+Evaluate the correctness of the following:
+
+Query:
+{query}
+
+Answer:
+{answer}
+
+Check:
+1. Factual correctness
+2. Logical validity
+3. Missing steps
+4. Hallucinations
+
+Reply ONLY in JSON:
+{{
+  "correct": true/false,
+  "issues": ["..."],
+  "needs_regeneration": true/false,
+  "corrected_answer": "..."
+}}
+"""
+
+    raw = call_ollama(VERIFIER_MODEL, prompt)
+
+    try:
+        res = json.loads(raw)
+    except:
+        res = {
+            "correct": False,
+            "issues": ["invalid JSON from verifier"],
+            "needs_regeneration": True,
+            "corrected_answer": ""
+        }
+    return res
+
+
+# =============================================================
+# SELF-CONSISTENCY (multi-pass)
+# =============================================================
+
+def self_consistent_answer(query: str, passes=SELF_CONSISTENCY_RUNS):
+    answers = []
+
+    for _ in range(passes):
+        ans = call_ollama(PRIMARY_MODEL, query)
+        answers.append(ans)
+
+    # majority vote
+    most_frequent = max(set(answers), key=answers.count)
+    confidence = answers.count(most_frequent) / passes
+
+    return {
+        "answers": answers,
+        "selected": most_frequent,
+        "confidence": confidence
+    }
+
+
+# =============================================================
+# GUARD MODEL
+# =============================================================
+
+def guard_review(prompt: str, response: str) -> Dict[str, Any]:
+    guard_prompt = f"""
+You are a safety guardrail model.
+
+User Prompt:
+{prompt}
+
+LLM Response:
+{response}
+
+Respond ONLY in JSON:
+{{
+  "prompt_injection": true/false,
+  "data_leak": true/false,
+  "harmful": true/false,
+  "block": true/false,
+  "reason": "..."
+}}
+"""
+
+    raw = call_ollama(GUARD_MODEL, guard_prompt)
+
+    try:
+        data = json.loads(raw)
+    except:
+        data = {
+            "prompt_injection": True,
+            "data_leak": False,
+            "harmful": False,
+            "block": True,
+            "reason": "Guard returned invalid JSON"
+        }
+
+    return data
+
+
+# =============================================================
+# MAIN MCIP PIPELINE
+# =============================================================
+
+class MCIPPipeline:
+    def __init__(self):
+        self.tracker = LogTracker()
+
+    def process(self, user_prompt: str) -> Dict[str, Any]:
+
+        # 1. record user request
+        self.tracker.add("user", "primary_model", user_prompt, "task request")
+
+        # 2. multi-pass consistency
+        sc = self_consistent_answer(user_prompt)
+        primary_output = sc["selected"]
+
+        self.tracker.add(
+            "primary_model", "verifier_model",
+            f"self-consistency runs={sc}",
+            "consistency check"
+        )
+
+        # 3. accuracy verification
+        accuracy = accuracy_review(user_prompt, primary_output)
+
+        self.tracker.add(
+            "verifier_model", "primary_model",
+            str(accuracy),
+            "accuracy review"
+        )
+
+        # regenerate with correction suggested
+        if accuracy["needs_regeneration"]:
+            if accuracy.get("corrected_answer", "").strip():
+                primary_output = accuracy["corrected_answer"]
+            else:
+                primary_output = call_ollama(PRIMARY_MODEL, user_prompt)
+
+        # 4. run guard model
+        guard = guard_review(user_prompt, primary_output)
+
+        self.tracker.add(
+            "guard_model", "primary_model",
+            str(guard),
+            "safety decision"
+        )
+
+        # 5. block?
+        if guard["block"]:
+            safe_msg = f"[BLOCKED] {guard['reason']}"
+            self.tracker.add("primary_model", "user", safe_msg, "blocked response")
+            return {
+                "response": safe_msg,
+                "accuracy": accuracy,
+                "consistency": sc,
+                "guard": guard,
+                "logs": self.tracker.dump()
+            }
+
+        # 6. final response to user
+        self.tracker.add("primary_model", "user", primary_output, "final response")
+
+        return {
+            "response": primary_output,
+            "accuracy": accuracy,
+            "consistency": sc,
+            "guard": guard,
+            "logs": self.tracker.dump()
+        }
+
+
+# =============================================================
+# DEMO USAGE
+# =============================================================
+
+if __name__ == "__main__":
+    pipeline = MCIPPipeline()
+    user_input = "Explain quantum computing in simple terms."
+    result = pipeline.process(user_input)
+
+    print("\nFINAL RESPONSE:\n", result["response"])
+    print("\nACCURACY CHECK:\n", result["accuracy"])
+    print("\nSELF CONSISTENCY:\n", result["consistency"])
+    print("\nGUARD:\n", result["guard"])
+    print("\nLOGS:")
+    for log in result["logs"]:
+        print(log)
