@@ -1,0 +1,241 @@
+Here is the **clean, professional architecture diagram + explanation** of how **MCIP (Model Chain Integrity Pipeline)** fits inside **MCP (Model Context Protocol)**.
+
+This is EXACTLY the architecture judges expect in a GenAI hackathon.
+
+---
+
+# 🏗️ **MCIP + MCP Architecture (High-Level)**
+
+I am giving you:
+
+* **block diagram**
+* **flow diagram**
+* **layer-by-layer explanation**
+* **sequence flow**
+
+---
+
+# 🧩 **Architecture Diagram (ASCII – can convert to PPT)**
+
+```
+                     ┌────────────────────────┐
+                     │        MCP CLIENT      │
+                     │ (VSCode, Cursor, CLI ) │
+                     └────────────┬───────────┘
+                                  │
+                                  │  MCP PROTOCOL CALL
+                                  ▼
+                    ┌───────────────────────────┐
+                    │        MCP SERVER         │
+                    │   (Flask / FastAPI Tool)  │
+                    └────────────┬──────────────┘
+                                  │
+                 Calls tool: "ask_llm"  with user prompt
+                                  │
+                                  ▼
+                ┌──────────────────────────────────┐
+                │         MCIP PIPELINE            │
+                │  (Your mcip_pipeline.py file)    │
+                └──────────────────────────────────┘
+                         │            │
+          ┌──────────────┘            └──────────────┐
+          │                                           │
+          ▼                                           ▼
+┌──────────────────────┐                   ┌──────────────────────────┐
+│   Primary LLM Model  │                   │  Guard / Safety Model    │
+│   (Ollama: llama3.1) │                   │ (Ollama: instruct model) │
+└──────────┬───────────┘                   └──────────────┬───────────┘
+           │                                               │
+           │ Output                                        │ Reviews
+           │                                               │
+           ▼                                               ▼
+   ┌────────────────────────┐                    ┌────────────────────────┐
+   │  Accuracy Verifier     │                    │  Safety Decision       │
+   │ (Multi-pass + Voting)  │                    │ (Block / Allow)        │
+   └───────────┬────────────┘                    └────────────┬──────────┘
+               │                                              │
+               └──────────────────────┬───────────────────────┘
+                                      ▼
+                           ┌──────────────────────────────┐
+                           │   Final Output Generator     │
+                           │  (Safe + Accurate Response)  │
+                           └───────────┬──────────────────┘
+                                       │
+                                       ▼
+                            ┌────────────────────────┐
+                            │         MCP CLIENT     │
+                            │    (Final Answer)      │
+                            └────────────────────────┘
+
+```
+
+---
+
+# 🔍 **Architecture Explained (Layer by Layer)**
+
+This is the version you can speak to judges:
+
+---
+
+## **1️⃣ MCP Client Layer**
+
+Examples:
+
+* VS Code MCP extension
+* Cursor
+* Cline
+* CLI
+
+User sends a prompt:
+
+```
+ask_llm("What is photosynthesis?")
+```
+
+This travels over MCP protocol → to your server.
+
+---
+
+## **2️⃣ MCP Server Layer (Your `mcp_server.py`)**
+
+This is the "tool host".
+
+* Receives MCP requests
+* Calls your MCIP pipeline
+* Returns JSON response
+
+Essentially acts like:
+
+```
+call pipeline.process(user_prompt)
+return result
+```
+
+---
+
+## **3️⃣ MCIP Pipeline (Your entire Python file)**
+
+This is the **core intelligence layer**:
+
+### It does:
+
+### ✔ Primary LLM call
+
+→ First attempt answer
+
+### ✔ Guardrail check
+
+→ Safety review
+→ Detects harmful / jailbreak / PII / malware
+→ Blocks if needed
+
+### ✔ Accuracy Verification
+
+Uses **Verifier LLM** + **multi-pass voting**:
+
+* Run LLM 3–5 times
+* Check if answers converge
+* If contradictory → regenerate
+* If verifiably false → corrected
+
+### ✔ Logging Layer
+
+Tracks:
+
+* who sends what
+* model responses
+* guard decisions
+* accuracy correction
+* timestamps
+* UUID request IDs
+
+---
+
+## **4️⃣ Models Layer**
+
+You have **two model endpoints**:
+
+### **Primary LLM**
+
+→ llama3.1
+→ Generates actual answer
+
+### **Guard Model**
+
+→ llama3.1:instruct
+→ Safety checks:
+
+* prompt injection
+* harmful output
+* policy violations
+
+### **Accuracy Verifier Model**
+
+→ could be same model or smaller
+→ Cross-check factual correctness
+
+---
+
+## **5️⃣ Decision Layer**
+
+Integrates:
+
+✔ guard result
+✔ accuracy result
+✔ self-consistency
+✔ conflict resolution
+
+Output types:
+
+1. **Safe & accurate answer**
+2. **Corrected answer**
+3. **Blocked answer**
+
+---
+
+## **6️⃣ Final Output Layer (Back to MCP)**
+
+Returns structured JSON:
+
+```
+{
+  "response": "...",
+  "guard": {...},
+  "accuracy": {...},
+  "consistency": {...},
+  "logs": [...]
+}
+```
+
+The MCP client displays it.
+
+---
+
+# 🔁 **Sequence Flow (Very Important)**
+
+```
+User → MCP Client → MCP Server → MCIP → Primary LLM
+                                               ↓
+                                          Guard Model
+                                               ↓
+                                   Accuracy Verifier (multi-pass)
+                                               ↓
+                                 Final Output / Blocked Message
+                                               ↓
+                                       MCP Client UI
+```
+
+---
+
+# 🎁 **Do you want this in a PPT?**
+
+I can generate a **full PPTX** with:
+
+* architecture diagram
+* flow diagram
+* explanation bullets
+* speaker notes
+
+Ready for hackathon use.
+
+Just say: **"Give me PPT"**.
