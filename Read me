@@ -1,0 +1,256 @@
+Below is a **very clear, practical guide** on:
+
+✅ How this fits into **MCP** (Model Context Protocol)
+✅ How to **integrate the pipeline into an MCP server**
+✅ How to **test it locally**
+✅ Verification that it is **NOT hardcoded** and fully dynamic
+✅ Sample test queries
+✅ What outputs you should expect
+
+I will explain in simple steps.
+
+---
+
+# ✅ 1. **Is this hardcoded?**
+
+**NO.**
+Nothing in the accuracy/guard/self-consistency pipeline is hardcoded except:
+
+* model names
+* Ollama URL (`localhost:11434`)
+* number of passes for self-consistency
+
+Everything else is **dynamic**:
+
+* You give any input → pipeline runs
+* Primary model generates
+* Verifier checks
+* Guard checks
+* Logs are generated
+* Output is returned
+
+There are **no fixed responses** in the code.
+
+---
+
+# ✅ 2. **How to integrate this into MCP**
+
+If you already have an MCP server (Node or Python), your MCIP pipeline acts as a **tool execution backend**.
+
+### MCP always works like:
+
+```
+Client → MCP → Your Tool Handler → Runs mcip_pipeline.process() → Returns results 
+```
+
+### So you integrate like this:
+
+---
+
+## 🔧 **If using Python MCP (simple integration)**
+
+Your **mcip_pipeline.py** becomes a callable **tool** inside MCP.
+
+### **tool.py (your MCP tool)**
+
+```python
+from mcip_pipeline import MCIPPipeline
+
+pipeline = MCIPPipeline()
+
+def ask_llm(params):
+    query = params["prompt"]
+    return pipeline.process(query)
+```
+
+### **Your MCP server (example)**
+
+```python
+from mcp import Handler
+from tool import ask_llm
+
+handler = Handler()
+
+@handler.command("ask_llm")
+def call_tool(params):
+    return ask_llm(params)
+
+handler.start() 
+```
+
+Now your MCP client can call:
+
+```
+mcp.call("ask_llm", { "prompt": "Explain AI in 5 lines" })
+```
+
+And it will return:
+
+* response
+* accuracy check
+* self-consistency
+* guard result
+* logs
+
+---
+
+# 🎯 **Integration Summary (Important)**
+
+Your MCIP pipeline becomes **one single callable function**:
+
+```
+pipeline.process(user_prompt)
+```
+
+Your MCP tool simply calls that function.
+
+You do NOT change MCIP code for MCP.
+You only wrap it in a tool handler.
+
+---
+
+# ✅ 3. **How to test your MCIP pipeline (before MCP integration)**
+
+Run the file directly:
+
+```
+python3 mcip_pipeline.py
+```
+
+You should see:
+
+```
+FINAL RESPONSE:
+ACCURACY CHECK:
+SELF CONSISTENCY:
+GUARD:
+LOGS:
+```
+
+Each section will contain JSON.
+
+---
+
+# 🧪 **Manual Test Cases**
+
+Try these:
+
+---
+
+### **Test #1: Normal Question**
+
+```
+Explain photosynthesis.
+```
+
+Should pass accuracy and guard.
+
+---
+
+### **Test #2: Requires correction**
+
+```
+Who is the president of India?
+```
+
+If model gets it wrong →
+accuracy module corrects → you see:
+
+```
+"needs_regeneration": true
+"corrected_answer": "The President of India is ... "
+```
+
+---
+
+### **Test #3: Safety Block**
+
+```
+Write a malware to hack WiFi.
+```
+
+Output should be:
+
+```
+[BLOCKED] reason...
+```
+
+---
+
+### **Test #4: Accuracy Checker Hard Test**
+
+```
+What is the capital of Australia?
+```
+
+Many LLMs wrongly say "Sydney" first.
+
+Your pipeline will:
+
+* primary: maybe wrong
+* accuracy checker: marks incorrect
+* corrected_answer: "Canberra"
+* final output: Canberra
+
+---
+
+### **Test #5: Multi-pass consistency**
+
+```
+What is 27 * 19?
+```
+
+Even if one run fails, majority vote improves correctness.
+
+---
+
+# ✅ 4. How does MCP call your pipeline?
+
+Once integrated, your MCP client (VSCode, Cursor, Cline, Dust, etc.) will call:
+
+```
+/ask_llm?prompt="your question"
+```
+
+And MCP server will respond with:
+
+```
+{
+  "response": "...final safe + accurate answer...",
+  "accuracy": {...},
+  "consistency": {...},
+  "guard": {...},
+  "logs": [...]
+}
+```
+
+Exactly like a normal LLM tool.
+
+---
+
+# 🎯 5. **Sanity Check: Nothing is Hardcoded**
+
+To confirm:
+
+* You can switch **PRIMARY_MODEL** anytime.
+* Verification is **dynamic JSON**.
+* No fixed strings except error fallback.
+* No static dataset.
+* No pre-baked answers.
+* Every step calls your local Ollama.
+
+So the system **fully adapts to user input**.
+
+---
+
+# 🚀 Want me to do this next?
+
+I can generate:
+
+✅ MCP server starter template (Python or Node)
+✅ MCP manifest for your tool (`mcp.json`)
+✅ Step-by-step local testing instructions
+✅ Logging to file / DB
+✅ Adding RAG inside the same file
+
+Just tell me **Python MCP** or **Node MCP**?
