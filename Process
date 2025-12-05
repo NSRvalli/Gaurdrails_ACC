@@ -1,0 +1,273 @@
+# Creating an Excel report with judges-loved insights and charts.
+# The script builds a sample transition pipeline output (mock), converts key outputs to
+# dataframes, writes them to an Excel workbook, generates matplotlib charts (one per figure),
+# embeds the chart images into the Excel file, and saves it to /mnt/data/transition_report.xlsx.
+#
+# After running, a download link to the created file will be provided.
+#
+# NOTE: This is standalone and uses mock/sample data similar to the scaffold previously provided.
+import json
+import datetime
+import uuid
+import statistics
+import pandas as pd
+import matplotlib.pyplot as plt
+import os
+
+# Use XlsxWriter as engine for embedding images
+output_path = "/mnt/data/transition_report.xlsx"
+
+# ---------- Sample input (similar to scaffold) ----------
+def sample_input():
+    return {
+        "artifacts": [
+            {"id": "t1", "type": "transcript", "text": "The primary DB is PostgreSQL. Backup run at 01:00. Restore steps: ..."},
+            {"id": "d1", "type": "doc", "text": "Runbook: restart service -> check logs -> notify team"}
+        ],
+        "inventory": [
+            {"app_id": "app-001", "name": "Payments", "components": ["api", "db", "queue"], "sla": 2, "criticality": "high", "required_skills": ["Linux", "Postgres"]},
+            {"app_id": "app-002", "name": "Reporting", "components": ["etl", "warehouse"], "sla": 3, "criticality": "medium", "required_skills": ["Python", "SQL"]},
+            {"app_id": "app-003", "name": "Auth", "components": ["oauth", "db"], "sla": 1, "criticality": "high", "required_skills": ["Identity", "Linux"]}
+        ],
+        "ticket_history": [
+            {"id": "T1", "priority": "P1", "status": "open", "category": "etl"},
+            {"id": "T2", "priority": "P0", "status": "open", "category": "auth"},
+            {"id": "T3", "priority": "P2", "status": "closed", "category": "api"},
+            {"id": "T4", "priority": "P2", "status": "open", "category": "etl"},
+            {"id": "T5", "priority": "P1", "status": "open", "category": "etl"}
+        ],
+        "health_metrics": {"payments": {"error_rate": 0.02}, "auth": {"error_rate": 0.1}},
+        "resource_profiles": [
+            {"resource_id": "r1", "skills": ["Linux", "Postgres"]},
+            {"resource_id": "r2", "skills": ["Python", "SQL"]},
+            {"resource_id": "r3", "skills": ["Identity", "AzureAD"]}
+        ],
+        "slas": [
+            {"app_id": "app-001", "sla_hours": 4, "on_call_required": 1},
+            {"app_id": "app-002", "sla_hours": 24, "on_call_required": 0},
+        ],
+        "metrics": {
+            "app-001": {"available_teams": 1},
+            "app-002": {"available_teams": 3}
+        }
+    }
+
+# ---------- Simple analysis functions (heuristics) ----------
+def build_risk_register(inventory):
+    risks = []
+    for item in inventory:
+        comp_count = len(item.get("components", []))
+        crit = {"low": 1, "medium": 2, "high": 3}.get(item.get("criticality", "medium"), 2)
+        score = comp_count * crit
+        risk_level = "HIGH" if score > 6 or item.get("sla", 99) > 4 else "MEDIUM" if score > 3 else "LOW"
+        risks.append({
+            "app_id": item.get("app_id"),
+            "name": item.get("name"),
+            "components": comp_count,
+            "criticality": item.get("criticality"),
+            "score": score,
+            "risk_level": risk_level
+        })
+    return risks
+
+def plan_kt(inventory):
+    sessions = []
+    for item in inventory:
+        level = "Advanced" if item.get("criticality") == "high" else "Standard"
+        session = {
+            "app_id": item["app_id"],
+            "app_name": item["name"],
+            "level": level,
+            "duration_hours": 2 if level == "Advanced" else 1,
+            "sme": "AppOwner"
+        }
+        sessions.append(session)
+    return sessions
+
+def generate_sops(inventory):
+    sops = []
+    for item in inventory:
+        sops.append({
+            "app_id": item["app_id"],
+            "title": f"SOP for {item['name']}",
+            "steps_count": 5 + len(item.get("components", []))
+        })
+    return sops
+
+def map_skills(inventory, resource_profiles):
+    mapping = []
+    for app in inventory:
+        required = app.get("required_skills", [])
+        matched = [r for r in resource_profiles if any(s in r.get("skills", []) for s in required)]
+        mapping.append({
+            "app_id": app["app_id"],
+            "app_name": app["name"],
+            "required_skills": ", ".join(required),
+            "matched_resources": ", ".join(r["resource_id"] for r in matched),
+            "gap_count": max(0, len(required) - len(matched))
+        })
+    return mapping
+
+def identify_automation(ticket_history, sops):
+    counts = {}
+    for t in ticket_history:
+        key = t.get("category", "general")
+        counts[key] = counts.get(key, 0) + 1
+    candidates = [{"category": k, "count": v, "suggested_automation": "RPA" if v > 5 else "Script"} for k, v in counts.items() if v > 1]
+    return candidates
+
+def sla_findings(slas, metrics):
+    findings = []
+    for s in slas:
+        metric = metrics.get(s.get("app_id"), {})
+        feasible = metric.get("available_teams", 0) >= s.get("on_call_required", 1)
+        findings.append({
+            "app_id": s.get("app_id"),
+            "sla_hours": s.get("sla_hours"),
+            "on_call_required": s.get("on_call_required"),
+            "available_teams": metric.get("available_teams", 0),
+            "feasible": feasible
+        })
+    return findings
+
+def compute_maturity(knowledge_score, avg_complexity, kt_plan, risk_summary):
+    read = knowledge_score
+    kt_completion = 1 - min(1, len(kt_plan)/10)
+    risk = 1 - min(1, risk_summary.get("high_risks_count", 0)/10)
+    score = (read/5.0)*2.0 + (kt_completion)*1.5 + (risk)*1.5
+    score = max(0.0, min(5.0, score))
+    return {"maturity_score": round(score,2), "breakdown": {"readiness": read, "kt_completion": kt_completion, "risk_factor": risk}}
+
+# ---------- Run mock pipeline ----------
+payload = sample_input()
+inventory = payload["inventory"]
+tickets = payload["ticket_history"]
+resource_profiles = payload["resource_profiles"]
+slas = payload["slas"]
+metrics = payload["metrics"]
+
+# Knowledge capture mock - produce readiness score 3.8
+knowledge = {"readiness_score": 3.8, "sop_bullets": ["Ensure backups", "Run health checks"]}
+
+dd = {}
+risk_register = build_risk_register(inventory)
+dd["risk_register"] = risk_register
+dd["avg_complexity"] = statistics.mean([r["score"] for r in risk_register]) if risk_register else 0
+# Wave plan simple
+sorted_apps = sorted(risk_register, key=lambda r: r["score"], reverse=True)
+dd["wave_plan"] = {"wave_1": [a["app_id"] for a in sorted_apps[:3]], "wave_2": [], "wave_3": []}
+
+sops = generate_sops(inventory)
+kt_plan = plan_kt(inventory)
+access_requests = [{"app_id": i["app_id"], "roles_required": ["Operator"], "owner": "TransitionPM"} for i in inventory]
+risk_summary = {
+    "high_risks": [t for t in tickets if t["priority"] in ("P0","P1")],
+    "open_critical": [t for t in tickets if t["status"] != "closed"],
+    "escalation_summary": {"high_risks_count": len([t for t in tickets if t["priority"] in ("P0","P1")])}
+}
+bom = {"project": "ICL-Migration", "wave_plan": dd["wave_plan"], "sop_count": len(sops)}
+skills = map_skills(inventory, resource_profiles)
+sla_findings_res = sla_findings(slas, metrics)
+automation = identify_automation(tickets, sops)
+maturity = compute_maturity(knowledge["readiness_score"], dd["avg_complexity"], kt_plan, risk_summary)
+
+# ---------- Convert to DataFrames ----------
+df_summary = pd.DataFrame([
+    {"metric": "maturity_score", "value": maturity["maturity_score"]},
+    {"metric": "avg_complexity", "value": dd["avg_complexity"]},
+    {"metric": "sop_count", "value": len(sops)},
+    {"metric": "total_apps", "value": len(inventory)},
+    {"metric": "open_critical_tickets", "value": len([t for t in tickets if t['status']!='closed'])}
+])
+
+df_risk = pd.DataFrame(risk_register)
+df_kt = pd.DataFrame(kt_plan)
+df_sops = pd.DataFrame(sops)
+df_skills = pd.DataFrame(skills)
+df_sla = pd.DataFrame(sla_findings_res)
+df_automation = pd.DataFrame(automation)
+
+# ---------- Create charts with matplotlib (one chart per figure) ----------
+chart_dir = "/mnt/data/charts"
+os.makedirs(chart_dir, exist_ok=True)
+
+# 1) Maturity breakdown bar (readiness, kt_completion, risk_factor)
+breakdown = maturity["breakdown"]
+fig1, ax1 = plt.subplots()
+ax1.bar(list(breakdown.keys()), [breakdown[k] for k in breakdown.keys()])
+ax1.set_title("Maturity Breakdown (sub-scores)")
+ax1.set_ylabel("Normalized value (0-1)")
+fig1_path = os.path.join(chart_dir, "maturity_breakdown.png")
+fig1.savefig(fig1_path, bbox_inches="tight")
+plt.close(fig1)
+
+# 2) Risk levels count (HIGH/MEDIUM/LOW)
+risk_counts = df_risk["risk_level"].value_counts().reindex(["HIGH","MEDIUM","LOW"]).fillna(0)
+fig2, ax2 = plt.subplots()
+ax2.bar(risk_counts.index.astype(str), risk_counts.values)
+ax2.set_title("Risk Level Counts")
+ax2.set_ylabel("Number of Applications")
+fig2_path = os.path.join(chart_dir, "risk_level_counts.png")
+fig2.savefig(fig2_path, bbox_inches="tight")
+plt.close(fig2)
+
+# 3) KT sessions duration per app (sum hours)
+kt_group = df_kt.groupby("app_name")["duration_hours"].sum()
+fig3, ax3 = plt.subplots()
+ax3.bar(kt_group.index.astype(str), kt_group.values)
+ax3.set_title("KT Session Duration per App (hours)")
+ax3.set_ylabel("Hours")
+fig3_path = os.path.join(chart_dir, "kt_duration_per_app.png")
+fig3.savefig(fig3_path, bbox_inches="tight")
+plt.close(fig3)
+
+# 4) Automation candidates (category counts)
+if not df_automation.empty:
+    fig4, ax4 = plt.subplots()
+    ax4.bar(df_automation["category"].astype(str), df_automation["count"])
+    ax4.set_title("Automation Candidate Counts by Category")
+    ax4.set_ylabel("Ticket Count")
+    fig4_path = os.path.join(chart_dir, "automation_candidates.png")
+    fig4.savefig(fig4_path, bbox_inches="tight")
+    plt.close(fig4)
+else:
+    fig4_path = None
+
+# ---------- Write Excel and embed charts ----------
+with pd.ExcelWriter(output_path, engine="xlsxwriter") as writer:
+    # Data sheets
+    df_summary.to_excel(writer, sheet_name="Summary", index=False)
+    df_risk.to_excel(writer, sheet_name="Risk Register", index=False)
+    df_kt.to_excel(writer, sheet_name="KT Plan", index=False)
+    df_sops.to_excel(writer, sheet_name="SOPs", index=False)
+    df_skills.to_excel(writer, sheet_name="Skills Mapping", index=False)
+    df_sla.to_excel(writer, sheet_name="SLA Findings", index=False)
+    df_automation.to_excel(writer, sheet_name="Automation", index=False)
+    # Insert charts as images into sheets
+    workbook  = writer.book
+    # Place maturity chart on Summary sheet
+    worksheet_summary = writer.sheets["Summary"]
+    worksheet_summary.insert_image("G2", fig1_path)
+    # Risk sheet chart
+    worksheet_risk = writer.sheets["Risk Register"]
+    worksheet_risk.insert_image("G2", fig2_path)
+    # KT sheet chart
+    worksheet_kt = writer.sheets["KT Plan"]
+    worksheet_kt.insert_image("G2", fig3_path)
+    # Automation sheet chart if exists
+    if fig4_path:
+        worksheet_auto = writer.sheets["Automation"]
+        worksheet_auto.insert_image("G2", fig4_path)
+
+# Display a preview of key dataframes to the user
+try:
+    # Use display helper when available
+    from caas_jupyter_tools import display_dataframe_to_user
+    display_dataframe_to_user("Summary Metrics", df_summary)
+except Exception:
+    # Fallback: print head
+    print("Summary metrics:")
+    print(df_summary.to_string(index=False))
+
+# Output file path for download
+print(f"\nExcel report created: {output_path}")
