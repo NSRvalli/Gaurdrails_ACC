@@ -1,0 +1,575 @@
+Nice — I’ll give you a **single, production-ready Python script** your team can drop into the MCP repo.
+What it does (immediately, no extra tools required):
+
+* Reads your `transition_output.json` (or uses a sample)
+* Computes the **missing enterprise KPIs**:
+
+  * Day-1 Readiness (componentized score)
+  * SOP Readiness (counts, % complete)
+  * SLA Feasibility (per-app feasibility + summary)
+  * Skill Gap Matrix (per-skill required vs available)
+  * Automation Opportunity Scoring (ticket-pattern heuristic + ROI estimate)
+  * Tollgate / Governance PASS-FAIL checks
+  * Wave Planner suggestions (wave assignment based on risk & readiness)
+  * Executive Summary (one-line KPIs for judges)
+* Emits:
+
+  * `transition_output_enriched.json` (same schema + new KPI sections)
+  * `transition_dashboard_enhanced.xlsx` (multiple sheets + embedded charts)
+  * `transition_dashboard_enhanced.html` (single-page dashboard for demo)
+* Clear extension points for MCP adapters (Jira/Confluence/IDAM/SharePoint).
+
+Drop the file into your MCP repo and run `python mcp_transition_kpis.py --input transition_output.json` to produce outputs. Below the script I include **practical integration instructions** for MCP (connectors, config, upsert, auth, observability, testing).
+
+---
+
+```python
+#!/usr/bin/env python3
+"""
+mcp_transition_kpis.py
+
+Generates enterprise-grade KPIs and dashboards (Excel + HTML) from a
+MCP transition JSON (transition_output.json). Designed to be config-driven
+and pluggable into your MCP pipeline.
+
+Usage:
+    python mcp_transition_kpis.py --input /path/to/transition_output.json
+    python mcp_transition_kpis.py --input sample   # uses builtin sample data
+
+Outputs:
+ - transition_output_enriched.json
+ - transition_dashboard_enhanced.xlsx
+ - transition_dashboard_enhanced.html
+
+Dependencies:
+ - pandas
+ - matplotlib
+ - xlsxwriter (optional but recommended; pandas will pick it up)
+Install: pip install pandas matplotlib xlsxwriter
+"""
+from __future__ import annotations
+import argparse
+import json
+import os
+import math
+import datetime
+from typing import Dict, Any, List, Tuple
+import pandas as pd
+import matplotlib.pyplot as plt
+import numpy as np
+
+# ---------------------------
+# Helpers & sample data
+# ---------------------------
+def sample_input() -> Dict[str, Any]:
+    """Minimal sample data — replace with your MCP output in production."""
+    return {
+        "project": "ICL-Migration",
+        "start_date": "2025-12-10",
+        "knowledge": {"readiness_score": 4.0, "sop_quality": 78, "kt_completion_pct": 80},
+        "inventory": [
+            {"app_id": "app-001", "name": "Payments", "components": ["api","db","queue","scheduler"], "sla_hours":4, "criticality":"high", "required_skills":["Linux","Postgres","Java"]},
+            {"app_id": "app-002", "name": "Reporting", "components": ["etl","warehouse"], "sla_hours":24, "criticality":"medium", "required_skills":["Python","SQL","Spark"]},
+            {"app_id": "app-003", "name": "Auth", "components": ["oauth","db","cache"], "sla_hours":2, "criticality":"high", "required_skills":["Identity","Linux"]},
+            {"app_id": "app-004", "name": "Notifications", "components": ["api","queue"], "sla_hours":48, "criticality":"low", "required_skills":["Node","RabbitMQ"]},
+            {"app_id": "app-005", "name": "Analytics", "components": ["stream","warehouse","ml"], "sla_hours":72, "criticality":"medium", "required_skills":["Python","ML","SQL"]}
+        ],
+        "tickets": [
+            {"id":"T1","priority":"P1","status":"open","category":"etl","age":2, "app_id":"app-002"},
+            {"id":"T2","priority":"P0","status":"open","category":"auth","age":1, "app_id":"app-003"},
+            {"id":"T3","priority":"P2","status":"closed","category":"api","age":10, "app_id":"app-001"},
+            {"id":"T4","priority":"P2","status":"open","category":"etl","age":5, "app_id":"app-002"},
+            {"id":"T5","priority":"P1","status":"open","category":"etl","age":3, "app_id":"app-002"},
+            {"id":"T6","priority":"P2","status":"open","category":"ml","age":4, "app_id":"app-005"},
+            {"id":"T7","priority":"P1","status":"open","category":"api","age":6, "app_id":"app-001"},
+            {"id":"T8","priority":"P2","status":"closed","category":"auth","age":12, "app_id":"app-003"}
+        ],
+        "resource_profiles": [
+            {"resource_id":"r1","skills":["Linux","Postgres","Java"]},
+            {"resource_id":"r2","skills":["Python","SQL"]},
+            {"resource_id":"r3","skills":["Identity","AzureAD"]},
+            {"resource_id":"r4","skills":["Node","RabbitMQ","Linux"]}
+        ],
+        "metrics": {"app-001":{"available_teams":1},"app-002":{"available_teams":3},"app-003":{"available_teams":0},"app-005":{"available_teams":2}},
+        "automation": {"estimated_monthly_tickets": 120, "automatable_pct": 0.25, "avg_effort_per_ticket_mins": 30},
+        "slo": {"availability":92,"performance":85,"security":88,"support":80},
+        # Optional: SOP list & statuses (if MCP has extracted them)
+        "sops": [
+            {"app_id":"app-001","title":"Payments SOP","status":"completed","version":"1.0"},
+            {"app_id":"app-002","title":"Reporting SOP","status":"draft","version":"0.3"}
+        ],
+        # Optional: Day-1 readiness primitive inputs (can be derived or provided)
+        "day1_inputs": {
+            "access": True,
+            "monitoring": True,
+            "env_ready": False,
+            "oncall_roster": True,
+            "sop_done_pct": 0.8
+        }
+    }
+
+def load_input(path: str) -> Dict[str, Any]:
+    if path == "sample":
+        return sample_input()
+    with open(path, "r") as fh:
+        return json.load(fh)
+
+def write_json(path: str, payload: Dict[str, Any]):
+    with open(path, "w") as fh:
+        json.dump(payload, fh, indent=2, default=str)
+
+# ---------------------------
+# KPI calculations
+# ---------------------------
+def calculate_day1_readiness(day1_inputs: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Weighted scoring template. Returns percentage 0-100.
+    Weights can be externalised to config.
+    """
+    # weights (configurable)
+    weights = {
+        "access": 20,
+        "monitoring": 20,
+        "env_ready": 25,
+        "oncall_roster": 15,
+        "sop_done_pct": 20
+    }
+    score = 0.0
+    score += weights["access"] if day1_inputs.get("access") else 0
+    score += weights["monitoring"] if day1_inputs.get("monitoring") else 0
+    score += weights["env_ready"] if day1_inputs.get("env_ready") else 0
+    score += weights["oncall_roster"] if day1_inputs.get("oncall_roster") else 0
+    # sop_done_pct is between 0-1
+    score += weights["sop_done_pct"] * float(day1_inputs.get("sop_done_pct", 0))
+    return {"day1_pct": round(score,2), "breakdown": weights}
+
+def calculate_sop_readiness(sops: List[Dict[str, Any]], inventory: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Returns per-app SOP completion % and overall.
+    If sops list is not per-app complete, uses heuristics.
+    """
+    req = {}
+    for app in inventory:
+        req[app["app_id"]] = {"required": 1, "completed": 0}  # minimal default
+    for s in sops:
+        aid = s.get("app_id")
+        if aid not in req:
+            req[aid] = {"required": 1, "completed": 0}
+        req[aid]["required"] += 0  # keep placeholder
+        if s.get("status") == "completed":
+            req[aid]["completed"] += 1
+    # compute %
+    per_app = {}
+    completed_counts = []
+    for aid, vals in req.items():
+        # avoid divide by zero
+        denom = vals["required"] if vals["required"]>0 else 1
+        pct = (vals["completed"] / denom) * 100
+        per_app[aid] = {"required": vals["required"], "completed": vals["completed"], "percent": round(pct,2)}
+        completed_counts.append(pct)
+    overall = round(sum(completed_counts)/len(completed_counts),2) if completed_counts else 0.0
+    return {"per_app": per_app, "overall_pct": overall}
+
+def calculate_sla_feasibility(slas: List[Dict[str, Any]], metrics: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    For each SLA record (expected application), check metric capacity.
+    Feasibility rule: available_teams >= on_call_required (simple)
+    """
+    findings = []
+    infeasible = 0
+    for s in slas:
+        app_id = s.get("app_id")
+        metric = metrics.get(app_id, {})
+        available = metric.get("available_teams", 0)
+        required = s.get("on_call_required", 1)
+        feasible = available >= required
+        findings.append({
+            "app_id": app_id,
+            "sla_hours": s.get("sla_hours"),
+            "on_call_required": required,
+            "available_teams": available,
+            "feasible": feasible
+        })
+        if not feasible:
+            infeasible += 1
+    summary = {"total_slas": len(slas), "infeasible_count": infeasible}
+    return {"findings": findings, "summary": summary}
+
+def compute_skill_gap(inventory: List[Dict[str, Any]], resource_profiles: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Produces a matrix of required skills vs available count.
+    """
+    required_counts = {}
+    for a in inventory:
+        for s in a.get("required_skills", []):
+            required_counts[s] = required_counts.get(s, 0) + 1
+    available_counts = {}
+    for r in resource_profiles:
+        for s in r.get("skills", []):
+            available_counts[s] = available_counts.get(s, 0) + 1
+    # compute gap per skill
+    gap = {}
+    for skill, req_count in required_counts.items():
+        avail = available_counts.get(skill, 0)
+        gap[skill] = {"required": req_count, "available": avail, "gap": max(0, req_count - avail)}
+    return {"required": required_counts, "available": available_counts, "gap": gap}
+
+def identify_automation_opportunities(tickets: List[Dict[str, Any]], sops: List[Dict[str, Any]], automation_config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Heuristic-based identification:
+     - categories with repeated tickets
+     - SOPs with many manual steps (if steps_count provided)
+    Returns candidates and an ROI estimate.
+    """
+    # ticket category counts
+    cat_counts = {}
+    for t in tickets:
+        k = t.get("category", "general")
+        cat_counts[k] = cat_counts.get(k, 0) + 1
+    ticket_candidates = []
+    for c, count in cat_counts.items():
+        if count >= 2:  # threshold configurable
+            ticket_candidates.append({"category": c, "count": count, "suggested": "Script" if count < 6 else "RPA"})
+    # SOP manual step heuristic (if steps_count in sops)
+    sop_candidates = []
+    for s in sops:
+        if s.get("steps_count", 0) > 10:
+            sop_candidates.append({"app_id": s.get("app_id"), "title": s.get("title"), "steps_count": s.get("steps_count"), "suggested": "Automation (RPA/Script)"})
+    # ROI estimate: hours saved = monthly_tickets * automatable_pct * avg_effort_mins / 60
+    est = automation_config or {"estimated_monthly_tickets": 0, "automatable_pct": 0.0, "avg_effort_per_ticket_mins": 0}
+    hours_saved = est["estimated_monthly_tickets"] * est["automatable_pct"] * (est["avg_effort_per_ticket_mins"]/60.0)
+    # assume rate param (configurable)
+    hourly_rate = est.get("hourly_value", 25)
+    monthly_value = round(hours_saved * hourly_rate, 2)
+    return {"ticket_candidates": ticket_candidates, "sop_candidates": sop_candidates, "hours_saved_monthly": hours_saved, "monthly_value_estimate": monthly_value}
+
+def perform_tollgate_checks(enriched: Dict[str, Any], thresholds: Dict[str, Any]=None) -> Dict[str, Any]:
+    """
+    Basic pass/fail rules for tollgates. thresholds is configurable.
+    Example rules:
+      - Day1 readiness >= 70
+      - SOP overall_pct >= 70
+      - Open P0/P1 <= 2
+    """
+    if thresholds is None:
+        thresholds = {"day1_pct": 70, "sop_pct": 70, "max_critical_open": 2}
+    day1 = enriched.get("day1_readiness", {}).get("day1_pct", 0)
+    sop_pct = enriched.get("sop_readiness", {}).get("overall_pct", 0)
+    # count open critical tickets
+    tickets = enriched.get("tickets", [])
+    open_crit = len([t for t in tickets if t.get("priority") in ("P0","P1") and t.get("status")!="closed"])
+    pass_readiness = day1 >= thresholds["day1_pct"]
+    pass_sop = sop_pct >= thresholds["sop_pct"]
+    pass_risk = open_crit <= thresholds["max_critical_open"]
+    overall = pass_readiness and pass_sop and pass_risk
+    return {"passes": {"readiness": pass_readiness, "sop": pass_sop, "risk": pass_risk}, "overall": overall, "open_critical_count": open_crit}
+
+def wave_planner_suggest(inventory: List[Dict[str, Any]], enriched: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Simple heuristic: assign apps to waves based on risk score (complexity*criticality) and SOP readiness.
+    returns a dict of waves -> list of app_ids
+    """
+    risk_register = []
+    # compute app-level risk score
+    for a in inventory:
+        comp_count = len(a.get("components", []))
+        crit_weight = 3 if a.get("criticality")=="high" else 2 if a.get("criticality")=="medium" else 1
+        score = comp_count * crit_weight
+        sop_pct = enriched.get("sop_readiness", {}).get("per_app", {}).get(a["app_id"], {}).get("percent", 0)
+        # lower sop_pct increases risk priority
+        penalty = 0 if sop_pct >= 80 else 1
+        risk_register.append({"app_id": a["app_id"], "name": a["name"], "score": score+penalty})
+    # sort desc
+    sorted_apps = sorted(risk_register, key=lambda x: x["score"], reverse=True)
+    # create waves: wave1 = top N , wave2 = next N, wave3 = rest (N can be dynamic)
+    N = max(1, math.ceil(len(sorted_apps)/3))
+    waves = {"wave_1": [a["app_id"] for a in sorted_apps[:N]],
+             "wave_2": [a["app_id"] for a in sorted_apps[N:2*N]],
+             "wave_3": [a["app_id"] for a in sorted_apps[2*N:]]}
+    return {"risk_register": risk_register, "wave_plan": waves}
+
+# ---------------------------
+# Reporting (Excel + HTML + JSON)
+# ---------------------------
+def generate_charts_and_write(files_prefix: str, enriched: Dict[str, Any]):
+    """Create charts and write Excel + HTML dashboard"""
+    out_dir = os.path.dirname(files_prefix) or "."
+    charts_dir = os.path.join(out_dir, "charts")
+    os.makedirs(charts_dir, exist_ok=True)
+
+    # Dataframes
+    inv = enriched.get("inventory", [])
+    df_inv = pd.DataFrame(inv)
+    df_tickets = pd.DataFrame(enriched.get("tickets", []))
+    sop_per_app = enriched.get("sop_readiness", {}).get("per_app", {})
+    df_sop = pd.DataFrame([{"app_id":k, **v} for k,v in sop_per_app.items()]) if sop_per_app else pd.DataFrame()
+    sla_findings = enriched.get("sla_feasibility", {}).get("findings", [])
+    df_sla = pd.DataFrame(sla_findings)
+
+    # Chart 1: Day-1 readiness gauge-like (bar)
+    day1 = enriched.get("day1_readiness", {}).get("day1_pct", 0)
+    fig, ax = plt.subplots(figsize=(4,2))
+    ax.bar(["Day-1 Readiness"], [day1], color=['#1f77b4'])
+    ax.set_ylim(0,100)
+    ax.set_ylabel("Percent")
+    ax.set_title("Day-1 Readiness")
+    path_day1 = os.path.join(charts_dir, "day1_readiness.png")
+    fig.savefig(path_day1, bbox_inches="tight"); plt.close(fig)
+
+    # Chart 2: SOP completion per app
+    if not df_sop.empty:
+        fig, ax = plt.subplots(figsize=(6,3))
+        ax.bar(df_sop["app_id"], df_sop["percent"])
+        ax.set_ylim(0,100); ax.set_title("SOP Completion % per App")
+        path_sop = os.path.join(charts_dir, "sop_completion.png")
+        fig.savefig(path_sop, bbox_inches="tight"); plt.close(fig)
+    else:
+        path_sop = None
+
+    # Chart 3: SLA feasibility counts
+    if not df_sla.empty:
+        df_sla["feasible_str"] = df_sla["feasible"].map({True:"Feasible", False:"Not Feasible"})
+        counts = df_sla["feasible_str"].value_counts()
+        fig, ax = plt.subplots(figsize=(4,2))
+        ax.bar(counts.index.astype(str), counts.values)
+        ax.set_title("SLA Feasibility")
+        path_sla = os.path.join(charts_dir, "sla_feas.png")
+        fig.savefig(path_sla, bbox_inches="tight"); plt.close(fig)
+    else:
+        path_sla = None
+
+    # Chart 4: Skill gap (heatmap)
+    skill_gap = enriched.get("skill_gap", {}).get("gap", {})
+    if skill_gap:
+        skills = list(skill_gap.keys())
+        reqs = [skill_gap[s]["required"] for s in skills]
+        avails = [skill_gap[s]["available"] for s in skills]
+        fig, ax = plt.subplots(figsize=(6,3))
+        x = np.arange(len(skills))
+        ax.bar(x - 0.15, reqs, width=0.3, label="Required")
+        ax.bar(x + 0.15, avails, width=0.3, label="Available")
+        ax.set_xticks(x); ax.set_xticklabels(skills, rotation=45, ha='right')
+        ax.legend(); ax.set_title("Skill Required vs Available")
+        path_skill = os.path.join(charts_dir, "skill_gap.png")
+        fig.savefig(path_skill, bbox_inches="tight"); plt.close(fig)
+    else:
+        path_skill = None
+
+    # Chart 5: Automation candidates - ticket category counts
+    auto = enriched.get("automation", {})
+    ticket_candidates = auto.get("ticket_candidates", [])
+    if ticket_candidates:
+        cats = [t["category"] for t in ticket_candidates]
+        counts = [t["count"] for t in ticket_candidates]
+        fig, ax = plt.subplots(figsize=(5,2))
+        ax.bar(cats, counts); ax.set_title("Automation Candidates (ticket categories)")
+        path_auto = os.path.join(charts_dir, "automation_candidates.png")
+        fig.savefig(path_auto, bbox_inches="tight"); plt.close(fig)
+    else:
+        path_auto = None
+
+    # Excel output with embedded images
+    excel_path = files_prefix + "_enhanced.xlsx"
+    with pd.ExcelWriter(excel_path, engine="xlsxwriter") as writer:
+        # Write dataframes
+        df_inv.to_excel(writer, sheet_name="Inventory", index=False)
+        df_tickets.to_excel(writer, sheet_name="Tickets", index=False)
+        if not df_sop.empty: df_sop.to_excel(writer, sheet_name="SOPs", index=False)
+        if not df_sla.empty: df_sla.to_excel(writer, sheet_name="SLA_Findings", index=False)
+        # Summary sheet
+        summary = {
+            "maturity_score": enriched.get("knowledge",{}).get("readiness_score"),
+            "day1_readiness_pct": day1,
+            "sop_overall_pct": enriched.get("sop_readiness",{}).get("overall_pct"),
+            "automation_monthly_value_estimate": enriched.get("automation",{}).get("monthly_value_estimate")
+        }
+        pd.DataFrame([summary]).to_excel(writer, sheet_name="Summary", index=False)
+        workbook = writer.book
+        # Insert images
+        sh = writer.sheets["Summary"]
+        sh.insert_image("H2", path_day1)
+        if path_sop:
+            sh.insert_image("H20", path_sop)
+        if path_sla:
+            sh.insert_image("H40", path_sla)
+        if path_skill:
+            sh.insert_image("H60", path_skill)
+        if path_auto:
+            sh.insert_image("H80", path_auto)
+    print("Excel written:", excel_path)
+
+    # HTML dashboard (single page)
+    html_path = files_prefix + "_enhanced.html"
+    with open(html_path, "w") as fh:
+        fh.write("<html><head><meta charset='utf-8'><title>Transition Dashboard</title></head><body>")
+        fh.write(f"<h1>Project: {enriched.get('project','-')}</h1>")
+        fh.write("<h2>Executive Summary</h2><ul>")
+        fh.write(f"<li>Maturity (knowledge): {enriched.get('knowledge',{}).get('readiness_score')}</li>")
+        fh.write(f"<li>Day-1 Readiness %: {day1}</li>")
+        fh.write(f"<li>SOP overall %: {enriched.get('sop_readiness',{}).get('overall_pct')}</li>")
+        fh.write("</ul>")
+        fh.write("<h2>Charts</h2>")
+        fh.write(f"<h3>Day-1 Readiness</h3><img src='{path_day1}' width='600'/>")
+        if path_sop: fh.write(f"<h3>SOP Completion</h3><img src='{path_sop}' width='700'/>")
+        if path_sla: fh.write(f"<h3>SLA Feasibility</h3><img src='{path_sla}' width='400'/>")
+        if path_skill: fh.write(f"<h3>Skill Gap</h3><img src='{path_skill}' width='700'/>")
+        if path_auto: fh.write(f"<h3>Automation Candidates</h3><img src='{path_auto}' width='600'/>")
+        fh.write("</body></html>")
+    print("HTML written:", html_path)
+
+    return {"excel": excel_path, "html": html_path, "charts_dir": charts_dir}
+
+# ---------------------------
+# Orchestration
+# ---------------------------
+def enrich_and_generate(input_path: str, output_prefix: str):
+    data = load_input(input_path)
+    # Compute day1 inputs: either provided or compute heuristically
+    day1_inputs = data.get("day1_inputs", {})
+    # If not present, attempt to infer: e.g., env_ready true if >0 infra metrics present (heuristic)
+    if not day1_inputs:
+        day1_inputs = {
+            "access": bool(data.get("sops")),
+            "monitoring": True,
+            "env_ready": False,
+            "oncall_roster": True,
+            "sop_done_pct": 0.5
+        }
+    day1 = calculate_day1_readiness(day1_inputs)
+    sops = data.get("sops", [])
+    sop_read = calculate_sop_readiness(sops, data.get("inventory", []))
+    sla_find = calculate_sla_feasibility(data.get("slas", []), data.get("metrics", {}))
+    skill_gap = compute_skill_gap(data.get("inventory", []), data.get("resource_profiles", []))
+    automation = identify_automation_opportunities(data.get("tickets", []), sops, data.get("automation", {}))
+    # integrate into enriched payload
+    enriched = dict(data)  # shallow copy
+    enriched["day1_readiness"] = day1
+    enriched["sop_readiness"] = sop_read
+    enriched["sla_feasibility"] = sla_find
+    enriched["skill_gap"] = skill_gap
+    enriched["automation"] = automation
+    # tollgate checks
+    toll = perform_tollgate_checks(enriched)
+    enriched["tollgate"] = toll
+    # wave planner
+    waves = wave_planner_suggest(data.get("inventory", []), enriched)
+    enriched["wave_planner"] = waves
+    # executive summary computed
+    enriched["executive_summary"] = {
+        "maturity": data.get("knowledge", {}).get("readiness_score"),
+        "day1_pct": day1.get("day1_pct"),
+        "sop_pct": sop_read.get("overall_pct"),
+        "tollgate_pass": toll.get("overall")
+    }
+    # write enriched JSON
+    enriched_path = output_prefix + "_enriched.json"
+    write_json(enriched_path, enriched)
+    print("Enriched JSON written:", enriched_path)
+    # generate charts & reports
+    reports = generate_charts_and_write(output_prefix, enriched)
+    return {"enriched_json": enriched_path, **reports}
+
+# ---------------------------
+# CLI
+# ---------------------------
+def main():
+    parser = argparse.ArgumentParser(description="Generate enterprise KPIs & dashboards from MCP transition JSON")
+    parser.add_argument("--input", "-i", type=str, default="sample", help="Path to transition_output.json or 'sample'")
+    parser.add_argument("--out-prefix", "-o", type=str, default="transition_dashboard", help="Output files prefix")
+    args = parser.parse_args()
+    res = enrich_and_generate(args.input, args.out_prefix)
+    print("Finished. Outputs:", res)
+
+if __name__ == "__main__":
+    main()
+```
+
+---
+
+# Integration instructions — how to plug this into MCP (concrete, step-by-step)
+
+1. **Place script into your MCP repo**
+
+   * e.g. `mcp/tools/mcp_transition_kpis.py`
+   * Commit & push to your feature branch.
+
+2. **Make the script config-driven**
+
+   * Replace hard-coded thresholds/weights at top or move into `config/kpis.yaml`.
+   * Example keys: `weights.day1`, `tollgate.thresholds`, `automation.hourly_rate`.
+
+3. **MCP adapter responsibility (where to add / how to call)**
+
+   * The MCP pipeline should already produce a canonical `transition_output.json`. Ensure it contains:
+
+     * `inventory` (apps)
+     * `tickets` (with priority, status, app_id)
+     * `resource_profiles`
+     * `sops` (if available)
+     * `slas` and `metrics` (teams available)
+     * Optional `day1_inputs` (explicit booleans)
+   * Add a final MCP step / job that:
+
+     * Fetches the latest `transition_output.json` (from object store, artifact store, or S3)
+     * Runs: `python mcp_transition_kpis.py --input /path/to/transition_output.json --out-prefix /tmp/transition_dashboard`
+     * Uploads the outputs (`*_enriched.json`, `*_enhanced.xlsx`, `*_enhanced.html`) to MCP artifact storage / Confluence / SharePoint / S3.
+
+4. **Adapting to adapters (Jira / Confluence / IDAM / SharePoint)**
+
+   * Provide an Adapter module in MCP:
+
+     * `adapters/jira_adapter.py` with functions: `fetch_tickets(project)`, `fetch_issues(query)`.
+     * `adapters/confluence_adapter.py` with `upload_page(title, html)` and `attach_file(page_id, filepath)`.
+     * `adapters/storage_adapter.py` with `upload_file(path, destination)`.
+   * Your MCP orchestrator should call these adapters BEFORE the KPI script to ensure `transition_output.json` has latest data or AFTER to publish results.
+   * **Important**: Use upsert logic on Confluence (search page by title then update), and attach charts rather than pasting huge HTML.
+
+5. **Secrets & auth**
+
+   * Use MCP secrets manager (do NOT hardcode tokens).
+   * Example env vars: `CONFLUENCE_USER`, `CONFLUENCE_API_TOKEN`, `S3_BUCKET`, `JIRA_TOKEN`.
+   * The adapters should read secrets from MCP secret store.
+
+6. **Idempotency & audit**
+
+   * Write enriched JSON with a timestamp and unique id:
+
+     * `enriched["meta"] = {"generated_at": now, "generated_by": "mcp_kpis_v1"}`
+   * When publishing to Confluence or SharePoint, use `upsert` (find page by title, update content) to avoid duplicates.
+
+7. **Observability**
+
+   * Emit an MCP event for success/failure with metrics: `kpis.generated`, chart count, tollgate result.
+   * Log prompt/LLM IDs (if used) and the file paths to allow traceability.
+
+8. **Testing**
+
+   * Unit-test every metric function with fixtures (create `tests/fixtures/*.json`).
+   * Smoke test: run script locally with `--input sample` and check outputs.
+   * End-to-end test: run the script in a staging MCP environment connected to sandbox Jira/Confluence.
+
+9. **Demo / Judges**
+
+   * For hackathon demo: run script locally, open the generated `*_enhanced.html` in browser, and show the `*_enhanced.xlsx` exported charts.
+   * In presentation, emphasize: “This script is purely a post-processing step — swap the `--input` to point to your MCP artifact storage to switch from demo to enterprise data.”
+
+---
+
+# Quick checklist for your team (to integrate within 2 hours)
+
+* [ ] Save script into MCP repo and install dependencies.
+* [ ] Ensure MCP produces `transition_output.json` in canonical schema.
+* [ ] Wire an MCP final task that runs the script and stores outputs.
+* [ ] Implement simple Confluence adapter to publish the HTML or attach Excel.
+* [ ] Run with `--input sample` and validate visuals.
+* [ ] Replace sample with real MCP artifact and re-run.
+
+---
+
+If you want now I can:
+
+* Convert this file into a downloadable single-file (I can generate it and provide link), **or**
+* Create the adapter stubs for Jira & Confluence (Python functions + example auth), **or**
+* Generate the `config/kpis.yaml` and a `Makefile` to run the pipeline.
+
+Which of these should I do next?
